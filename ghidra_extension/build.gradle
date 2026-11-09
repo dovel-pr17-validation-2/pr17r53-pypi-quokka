@@ -29,7 +29,7 @@ repositories {
 // Use compileOnly so we compile against the same version without packaging it.
 def quokkaVersion = '1.0.0'
 
-def protobufVersion = '4.31.0'
+def protobufVersion = '4.36.2'
 
 dependencies {
     compileOnly "com.google.protobuf:protobuf-java:${protobufVersion}"
