@@ -1,0 +1,506 @@
+// Copyright 2022-2023 Quarkslab
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <sys/types.h>
+#include <algorithm>
+#include <cassert>
+#include <cctype>
+#include <cstdarg>
+#include <cstddef>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <ios>
+#include <string>
+#include <utility>
+#include <vector>
+
+// clang-format off: Compatibility.h must come before ida headers
+#include "quokka/Compatibility.h"
+// clang-format on
+#include <pro.h>
+#include <auto.hpp>
+#include <config.hpp>
+#include <expr.hpp>
+#include <ida.hpp>
+#include <idp.hpp>
+#include <kernwin.hpp>
+#include <loader.hpp>
+#include <nalt.hpp>
+#ifdef HAS_HEXRAYS
+#include <hexrays.hpp>
+#endif
+
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_join.h"
+#include "absl/time/clock.h"
+
+#include "quokka/DataType.h"
+#include "quokka/FileMetadata.h"
+#include "quokka/Function.h"
+#include "quokka/Layout.h"
+#include "quokka/Logger.h"
+#include "quokka/LzmaStreambuf.h"
+#include "quokka/ProtoWrapper.h"
+#include "quokka/Quokka.h"
+#include "quokka/Reference.h"
+#include "quokka/Segment.h"
+#include "quokka/Settings.h"
+#include "quokka/Util.h"
+#include "quokka/Version.h"
+#include "quokka/Writer.h"
+
+namespace quokka {
+
+/**
+ * Retrieve the argument passed on the command line
+ *
+ * An option may be passed to a plugin using the -O{PluginName}{Option}={Value}
+ *
+ * @param name Name of the argument
+ * @param to_upper Should we convert the value to upper case ?
+ * @return
+ */
+static std::string GetArgument(const char* name, bool to_upper = false) {
+  const char* option = get_plugin_options(absl::StrCat("Quokka", name).c_str());
+
+  if (option != nullptr) {
+    std::string option_s(option);
+    if (to_upper) {
+      std::transform(
+          option_s.begin(), option_s.end(), option_s.begin(),
+          [](unsigned char c) -> unsigned char { return std::toupper(c); });
+    }
+    return option_s;
+  }
+
+  return "";
+}
+
+/**
+ * Retrieve the export mode by looking at the argument passed on the command
+ * line
+ *
+ * @return The correct export mode. By default it is MODE_LIGHT
+ */
+static ExporterMode GetModeFromArgument() {
+  // Look for options on command line
+  ExporterMode mode = ExporterMode::MODE_LIGHT;
+  std::string quokka_mode = GetArgument("Mode", true);
+  if (quokka_mode == "LIGHT") {
+    mode = ExporterMode::MODE_LIGHT;
+  } else if (quokka_mode == "SELF_CONTAINED") {
+    mode = ExporterMode::MODE_SELF_CONTAINED;
+  } else {
+    QLOGW << "Unknown mode provided in argument, using default (NORMAL)";
+  }
+
+  return mode;
+}
+
+/**
+ * Return an output filename
+ *
+ * First try to see if the option "File" as been set.
+ * Then try to store it in the same directory as input file using "
+ * .Quokka" extension
+ *
+ * @return A potential output file name
+ */
+static std::string GetOutputFileName() {
+  std::string output_file = GetArgument("File");
+  if (output_file.empty()) {
+    char path[QMAXPATH] = {0};
+    get_input_file_path(path, QMAXPATH);
+    output_file = absl::StrCat(path, ".quokka");
+  }
+  return output_file;
+}
+
+/**
+ * Export the binary to filename
+ *
+ * Here we are ! Main method of the plugin, will take care of export the
+ * loaded binary.
+ *
+ * @note If the filename is not writable, another try will be made in the
+ * /tmp directory. However, this will not works on Windows.
+ *
+ * @return Code for success
+ */
+static int ExportBinary(const std::string& filename) {
+  GOOGLE_PROTOBUF_VERIFY_VERSION;
+  Quokka quokka_protobuf;
+
+  show_wait_box("quokka: start export");
+
+  QLOGI << absl::StrFormat("Exporter set in %s",
+                           Settings::GetInstance().GetModeString());
+  QLOGI << absl::StrFormat("Starting to export to %s", filename);
+
+  Timer timer(absl::Now());
+
+  // Always start by meta !
+  {
+    SCOPED_BOX_STEP("quokka: exporting meta information",
+                    "Starting to export meta information...",
+                    "meta information exported successfully");
+    WriteExporterMeta(&quokka_protobuf);
+    ExportMeta(&quokka_protobuf);
+  }
+
+  // Export segments (must outlive all other objects)
+  {
+    SCOPED_BOX_STEP("quokka: exporting segments",
+                    "Starting to export segments...",
+                    "Segments exported successfully");
+    ExportSegments();
+  }
+
+  // Export functions (decompiler runs here, may create/modify types)
+  decltype(ExportFunctions()) funcs_and_ranges;
+  {
+    Timer timer(absl::Now());
+    replace_wait_box("quokka: exporting functions");
+    QLOGI << "Starting to export functions...";
+    funcs_and_ranges = ExportFunctions();
+    const auto& [functions, ranges] = funcs_and_ranges;
+    QLOGI << absl::StrFormat("%d functions exported successfully (took: %.2fs)",
+                             functions.size(),
+                             timer.ElapsedSeconds(absl::Now()));
+  }
+  auto [functions, ranges] = std::move(funcs_and_ranges);
+
+  // Export data types (after functions so decompiler-created types are
+  // captured)
+  {
+    SCOPED_BOX_STEP("quokka: exporting data types",
+                    "Starting to export data types...",
+                    "Data types exported successfully");
+    WriteHeaders(&quokka_protobuf);
+    ExportEnums();
+    ExportCompositeDataTypes();
+    ExportTypedefs();
+    ResolveDeferredSymbolXrefs();
+  }
+
+  // Export layout and remaining data through linear scanning
+  replace_wait_box("quokka: linear scan in progress");
+  ExportLinearScan(&quokka_protobuf, std::move(ranges));
+
+  // Write on the protobuf
+  {
+    SCOPED_STEP("Writing functions in the protobuf message...",
+                "Protobuf message populated");
+    WriteFunctions(&quokka_protobuf, std::move(functions));
+  }
+
+  replace_wait_box("quokka: compressing & writing");
+  QLOG_INFO << "Compressing and writing the file...";
+  std::string outfile = filename;
+
+  std::fstream file(outfile,
+                    std::ios::binary | std::ios::out | std::ios::trunc);
+  if (!file) {
+    QLOG_ERROR << absl::StrFormat("Failed to open file %s for writing",
+                                  outfile);
+    return false;
+  }
+
+  LzmaStreambuf lzma_buf(file);
+  std::ostream lzma_out(&lzma_buf);
+
+  if (!quokka_protobuf.SerializeToOstream(&lzma_out)) {
+    // Print internal state for debugging
+    QLOG_ERROR << "Failed to serialize protobuf to output stream";
+    QLOG_ERROR << absl::StrFormat(
+        "Stream state: good=%d, bad=%d, fail=%d, eof=%d", lzma_out.good(),
+        lzma_out.bad(), lzma_out.fail(), lzma_out.eof());
+    QLOG_ERROR << absl::StrFormat(
+        "Underlying file state: good=%d, bad=%d, fail=%d", file.good(),
+        file.bad(), file.fail());
+
+    // Check protobuf message size to see if it exceeds 2GB limit
+    size_t msg_size = quokka_protobuf.ByteSizeLong();
+    QLOG_INFO << absl::StrFormat("Protobuf message size: %.2f MB",
+                                 msg_size / (1024.0 * 1024.0));
+    if (msg_size > INT_MAX) {
+      QLOG_ERROR << "Protobuf message exceeds 2GB serialization limit";
+    }
+
+    return false;
+  }
+
+  if (!lzma_buf.finish()) {
+    QLOG_ERROR << "Failed to finalize LZMA stream";
+    return false;
+  }
+
+  uint64_t in_size = lzma_buf.total_in();
+  uint64_t out_size = lzma_buf.total_out();
+
+  QLOG_INFO << absl::StrFormat("Compressed %llu bytes -> %llu bytes (%.1f%%)",
+                               in_size, out_size,
+                               (100.0 * (in_size - out_size) / in_size));
+
+  QLOG_INFO << absl::StrFormat("File %s is written", outfile);
+  QLOG_INFO << absl::StrFormat("quokka finished (took %.2fs)",
+                               timer.ElapsedSeconds(absl::Now()));
+
+  // Clean everything
+  google::protobuf::ShutdownProtobufLibrary();
+
+  hide_wait_box();
+
+  return eOk;
+}
+
+static error_t idaapi IdcQuokka(idc_value_t*, idc_value_t* res) {
+  QLOG_DEBUG << "Calling Quokka from IDC";
+
+  ExportBinary(GetOutputFileName());
+  res->i64 = 0;
+
+  return eOk;
+}
+
+static const char functionArgs[] = {0};
+static const ext_idcfunc_t kquokkaIdcFunc = {"quokka", IdcQuokka, functionArgs,
+                                             nullptr,  0,         EXTFUN_BASE};
+
+bool GetBoolArgument(const char* name, bool default_value) {
+  std::string option = GetArgument(name, true);
+  if (option.empty()) {
+    return default_value;
+  } else {
+    std::transform(
+        option.begin(), option.end(), option.begin(),
+        [](unsigned char c) -> unsigned char { return std::toupper(c); });
+    return (option == "TRUE");
+  }
+}
+
+void UnsimplifyARM() {
+  processor_t* processor = GetProcessor();
+  if (processor->id == PLFM_ARM) {
+    QLOGI << "Remove simplification in ARM assembly";
+    int no = 0;
+    processor->set_idp_options("ARM_SIMPLIFY", IDPOPT_BIT, &no, false);
+    // TODO(dm) Find a way to access the initial value to restore it
+  }
+}
+
+ssize_t idaapi UIHook(void* /* not used */, int event_id,
+                      va_list /* arguments */) {
+  if (event_id != ui_ready_to_run) {
+    return 0;
+  }
+
+  const bool auto_action = GetBoolArgument("Auto", false);
+  if (!auto_action) {
+    return 0;
+  }
+
+  QLOGI << "Auto Export";
+  auto_wait();
+
+  // Retrieve mode from argument
+  Settings::GetInstance().SetMode(GetModeFromArgument());
+
+  // Retrieve if we need to export decompiled code
+  bool export_decompiled = GetBoolArgument("Decompiled", false);
+  if (export_decompiled) {
+#ifdef HAS_HEXRAYS
+    if (init_hexrays_plugin()) {
+      QLOGI << "Hex-Rays plugin initialized. Decompilation: "
+            << (export_decompiled ? "enabled" : "disabled");
+      Settings::GetInstance().SetExportDecompiledCode(export_decompiled);
+    } else {
+      QLOGW << "Hex-Rays plugin not available, cannot export decompiled code";
+    }
+#else
+    QLOGW << "Quokka compiled without Hex-Rays support";
+    // Settings already false by default.
+#endif
+  }
+
+  ExportBinary(GetOutputFileName());
+
+  // TODO(dm) Set the flag only when we are loading from a database
+  // Or set an option to see if we need to save the database
+#ifdef HAS_HEXRAYS
+  term_hexrays_plugin();
+#endif
+
+  // set_database_flag(DBFL_KILL);
+  qexit(0);
+}
+
+void SetLogLevel() {
+  std::string cli_level = GetArgument("Log", true);
+  LogLevel level = LogLevel::INFO;
+  if (!cli_level.empty()) {
+    if (cli_level == "DEBUG") {
+      level = LogLevel::DEBUG;
+    } else if (cli_level == "ERROR") {
+      level = LogLevel::ERROR;
+    }
+  }
+  Logger::GetInstance().SetLevel(level);
+  Logger::GetInstance().SetDefaultUi(is_msg_inited());
+}
+
+bool PluginInit() {
+  SetLogLevel();
+
+  std::string_view version = GetVersion();
+  QLOGI << absl::StrFormat("Starting to register Quokka (version %s)", version);
+
+  addon_info_t addon_info;
+  addon_info.cb = sizeof(addon_info_t);
+  addon_info.id = "quokka";
+  addon_info.name = "Quokka";
+  addon_info.producer = "Quarkslab";
+  addon_info.version = version.data();
+  addon_info.url = "https://www.quarkslab.com";
+  addon_info.freeform = "";
+  register_addon(&addon_info);
+
+  // Unsimplify ARM
+  UnsimplifyARM();
+
+  if (!hook_to_notification_point(HT_UI, UIHook, nullptr)) {
+    QLOGF << "Unable to register plugin";
+    return false;
+  }
+
+  // Register the function to call from IDC
+  if (!add_idc_func(kquokkaIdcFunc)) {
+    QLOGE << "Cannot register IDC function";
+    return false;
+  }
+
+  return true;
+}
+
+bool idaapi PluginRun(size_t) {
+  QLOGI << "Quokka started";
+
+  if (strlen(get_path(PATH_TYPE_IDB)) == 0) {
+    error("You must open an IDB first\n");
+  }
+
+  /*
+    Field documentation:
+    https://cpp.docs.hex-rays.com/group___f_o_r_m___c.html#ga56bdea2f1808b588da54c343f42ebf41
+  */
+  std::vector<std::string> form = {
+      "STARTITEM 0",
+      "BUTTON YES Export",
+      "BUTTON CANCEL Cancel",
+      "HELP",
+      "Export the current binary with quokka",
+      absl::StrFormat("Version : %s", GetVersion()),
+      "ENDHELP",
+      "Quokka Plugin (@Quarkslab)",
+      "\nExport the current binary ?\n",
+      "<#Light mode#Choose a mode##LIGHT:R>",
+      "<#Self contained mode#SELF_CONTAINED:R>>",
+#ifdef HAS_HEXRAYS
+      "<#Requires hex-rays (slows down export)#Export Decompiled:C>>"
+#endif
+  };
+
+  std::string dialog = absl::StrJoin(form, "\n");
+  ushort mode_input = 1;
+  ushort do_decompiled = 0;
+  if (ask_form(dialog.c_str(), &mode_input, &do_decompiled) == ASKBTN_YES) {
+    // Check if the mode has been selected
+    ExporterMode mode;
+    switch (mode_input) {
+      case 0:
+        mode = ExporterMode::MODE_LIGHT;
+        break;
+      case 1:
+        mode = ExporterMode::MODE_SELF_CONTAINED;
+        break;
+      default:
+        assert(false && "Impossible choice for export mode");
+    }
+
+    Settings::GetInstance().SetMode(mode);
+
+    // Check if hex-rays plugin is available
+#ifdef HAS_HEXRAYS
+    if (init_hexrays_plugin()) {
+      QLOGI << "Hex-Rays plugin initialized";
+      Settings::GetInstance().SetExportDecompiledCode(do_decompiled != 0);
+    } else if (do_decompiled != 0) {
+      QLOGW << "Hex-Rays plugin not available, cannot export decompiled code";
+    }
+#endif
+
+    std::string default_name = GetOutputFileName();
+    const char* filename =
+        ask_file(true, default_name.c_str(),
+                 "FILTER Quokka Files|*.quokka\nSelect an output file");
+
+    if (!filename || std::filesystem::exists(std::filesystem::path(filename)) &&
+                         ask_yn(ASKBTN_NO, "'%s' already exists, overwrite?",
+                                filename) != ASKBTN_YES) {
+      return false;
+    }
+
+    return ExportBinary(std::string(filename)) == eOk;
+  }
+
+  return true;
+}
+
+void idaapi PluginTerminate() {
+  unhook_from_notification_point(HT_UI, UIHook, nullptr);
+
+  del_idc_func("Quokka");
+
+  QLOGI << "Quokka: terminate";
+}
+
+}  // namespace quokka
+
+#if IDA_SDK_VERSION > 740
+static plugmod_t* idaapi init() { return new quokka::plugin_ctx_t; }
+#else
+int idaapi init(void) {
+  quokka::PluginInit();
+  return PLUGIN_KEEP;
+}
+
+void idaapi term(void) { quokka::PluginTerminate(); }
+
+bool idaapi run(size_t args) { return quokka::PluginRun(args); };
+#endif
+
+plugin_t PLUGIN{
+    IDP_INTERFACE_VERSION,
+#if IDA_SDK_VERSION > 740
+    PLUGIN_UNL | PLUGIN_MULTI,    init,          nullptr,  nullptr,
+#else
+    PLUGIN_UNL,
+    init,
+    term,
+    run,
+#endif
+    "This module exports binary", "Quokka help", "Quokka", "Alt+A",
+};

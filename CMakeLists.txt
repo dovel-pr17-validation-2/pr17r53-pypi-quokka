@@ -1,0 +1,200 @@
+cmake_minimum_required(VERSION 3.13)
+
+find_program(COMPILER_CACHE NAMES ccache sccache
+        PATHS /opt/ccache)
+
+if (COMPILER_CACHE)
+    message(STATUS "Enable compiler cache: ${COMPILER_CACHE}")
+    set(CMAKE_C_COMPILER_LAUNCHER "${COMPILER_CACHE}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${COMPILER_CACHE}")
+endif ()
+
+set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Targeting MacOS Version" FORCE)
+
+project(quokka
+        DESCRIPTION "Quokka: A Fast and Accurate Binary Exporter"
+        VERSION 1.0.0
+        LANGUAGES CXX)
+
+list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
+
+include(FetchContent)
+include(CheckLinkerFlag)
+include(GoogleTest)
+
+if (PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR)
+    cmake_print_variables(PROJECT_SOURCE_DIR PROJECT_BINARY_DIR)
+    message(FATAL_ERROR "In source builds are not allowed")
+endif ()
+
+
+if (NOT CMAKE_BUILD_TYPE)
+    # Set a default build type if none was specified.
+    # Warning: does work only for single configurations generators
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+endif ()
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_INSTALL_PREFIX ${quokka_BINARY_DIR})
+set(IDA_SDK_PATH ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ida-sdk)
+
+option(BUILD_TEST "Build C++ test binaries (need gtest)" OFF)
+option(NO_BUILD "Don't build plugin" OFF)
+option(NO_DEPRECATED "Don't use deprecated functions from IDA SDK" OFF)
+option(ENABLE_SANITIZER "Enable address sanitizer" OFF)
+option(IDA_VERSION "Specify the version of IDA SDK, like 9.2 (works only on >=9.2)" "")
+
+if (IDA_VERSION)
+    # Check if IDA_VERSION is <major>.<minor> (TODO maybe add also spX)
+    if(NOT IDA_VERSION MATCHES "^[0-9]+\\.[0-9]+$")
+        message(FATAL_ERROR
+            "Variable IDA_VERSION must be in format <major>.<minor> (e.g. 9.2). "
+            "Got: ${IDA_VERSION}")
+    endif()
+    
+    # Check if IDA_VERSION is >= 9.2
+    string(REPLACE "." ";" _ida_version_list "${IDA_VERSION}")
+    list(GET _ida_version_list 0 IDA_VERSION_MAJOR)
+    list(GET _ida_version_list 1 IDA_VERSION_MINOR)
+    if((IDA_VERSION_MAJOR LESS 9) OR (IDA_VERSION_MAJOR EQUAL 9 AND IDA_VERSION_MINOR LESS 2))
+        message(FATAL_ERROR
+            "Variable IDA_VERSION must be at least 9.2. Got: ${IDA_VERSION}. "
+            "Older versions are supported but the sdk is private source. "
+            "Use IdaSdk_ROOT_DIR to point to the right path of the sdk")
+    endif()
+
+    message(STATUS "Using IDA SDK version ${IDA_VERSION}")
+
+    # Init the submodule
+    execute_process(
+        COMMAND git submodule update --init --recursive ${IDA_SDK_PATH}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    # Checkout the correct tag inside the submodule
+    execute_process(
+        COMMAND git -C ${IDA_SDK_PATH} fetch --tags
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        RESULT_VARIABLE GIT_RESULT
+    )
+    if (NOT GIT_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to fetch new tags from IDA SDK")
+    endif()
+    execute_process(
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        RESULT_VARIABLE GIT_RESULT
+        COMMAND git -C ${IDA_SDK_PATH} checkout v${IDA_VERSION}
+    )
+    if (NOT GIT_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to checkout IDA SDK version ${IDA_VERSION}")
+    endif()
+
+    # Override the old variable
+    set(IdaSdk_ROOT_DIR "${IDA_SDK_PATH}/src" CACHE PATH "" FORCE)
+endif ()
+
+if (UNIX)
+    if(APPLE)
+        # Use the system Apple Clang toolchain (libc++ and the macOS SDK are its
+        # defaults). We intentionally do not pin a Homebrew LLVM here.
+        add_compile_options(
+            "$<$<CONFIG:Debug>:-gfull>"
+            -Wno-nullability-completeness
+        )
+
+        # Originates from google/binexport
+        # https://github.com/google/binexport/blob/85c89a4ab96febcccc4cdc01ca5fc6c005e9a2cf/cmake/CompileOptions.cmake#L71-L74
+        check_linker_flag(CXX "LINKER:-ld_classic" _ld_classic_supported)
+        if(_ld_classic_supported)
+          add_link_options(LINKER:-ld_classic)
+        endif()
+
+        add_link_options(
+            -dead_strip
+        )
+
+        execute_process(
+            COMMAND xcrun --sdk macosx --show-sdk-path
+            OUTPUT_VARIABLE SDKROOT
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+
+        message(STATUS "Using macOS SDK: ${SDKROOT}")
+
+        set(CMAKE_OSX_SYSROOT "${SDKROOT}")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -isysroot ${SDKROOT}")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -isysroot ${SDKROOT} -stdlib=libc++")
+    else()
+    endif()
+elseif(WIN32)
+endif()
+
+# Abseil is needed by both the plugin and standalone tests
+if (NOT NO_BUILD OR BUILD_TEST)
+    set(ABSL_PROPAGATE_CXX_STD ON)
+
+    FetchContent_Declare(
+            abseil
+            GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
+            GIT_TAG 20250127.0
+    )
+    FetchContent_MakeAvailable(abseil)
+endif ()
+
+if (NOT NO_BUILD)
+    set(GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/quokka/Version.h.in"
+        "${GENERATED_INCLUDE_DIR}/quokka/Version.h"
+        @ONLY
+    )
+
+    if (ENABLE_SANITIZER)
+        add_compile_options(-fsanitize=address -fno-omit-frame-pointer -fno-optimize-sibling-calls)
+        add_link_options(-fsanitize=address)
+
+    endif ()
+
+    FetchContent_Declare(
+            protobuf
+            GIT_REPOSITORY https://github.com/protocolbuffers/protobuf.git
+            GIT_TAG v30.2
+    )
+    set(protobuf_BUILD_TESTS OFF CACHE INTERNAL "")
+    set(protobuf_INSTALL OFF CACHE BOOL "" FORCE)
+    set(protobuf_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(protobuf_BUILD_PROTOBUF_BINARIES ON CACHE BOOL "" FORCE)
+    set(protobuf_INSTALL OFF CACHE BOOL "" FORCE)
+    set(protobuf_WITH_ZLIB_DEFAULT OFF CACHE BOOL "" FORCE)
+    set(protobuf_MSVC_STATIC_RUNTIME OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(protobuf)
+
+    # Find protoc
+    set(_PROTOBUF_PROTOC $<TARGET_FILE:protoc>)
+
+    # Include protobuf functions
+    include(cmake/protobuf.cmake)
+
+    find_package(LibLZMA REQUIRED)
+
+    find_package(IdaSdk REQUIRED)
+
+    add_subdirectory(proto)
+
+    add_subdirectory(src)
+
+endif ()
+
+if (CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME AND BUILD_TEST)
+    FetchContent_Declare(
+            googletest
+            GIT_REPOSITORY https://github.com/google/googletest.git
+            GIT_TAG release-1.12.1
+    )
+    FetchContent_MakeAvailable(googletest)
+
+    enable_testing()
+    add_subdirectory(tests)
+endif ()

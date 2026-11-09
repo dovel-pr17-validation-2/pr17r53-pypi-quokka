@@ -1,0 +1,677 @@
+name: quokka-build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "*"
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "src/**"
+      - "include/**"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "proto/**"
+      - "tests/cpp/**"
+      - "scripts/**"
+      - "third_party/ida-sdk/**"
+      - "sdk_lockfile"
+      - ".gitmodules"
+      - ".github/workflows/build.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+
+permissions: {}
+
+jobs:
+  setup:
+    name: Determine build scope
+    runs-on: ubuntu-latest
+    outputs:
+      ida_versions: ${{ steps.set-matrix.outputs.ida_versions }}
+      full_build: ${{ steps.set-matrix.outputs.full_build }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine build scope
+        id: set-matrix
+        shell: bash
+        run: |
+          FULL='["74","77","80","81","82","83","84","85","90","90sp1","91","9.2","9.3"]'
+          RELEASE='["91","9.2","9.3"]'
+          # LIGHT='["77","85","9.2","9.3"]'
+          LIGHT='["91", "9.2","9.3"]' # Temporarily set to 9.x
+
+          # Full build for releases (tag pushes)
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "ida_versions=$RELEASE" >> "$GITHUB_OUTPUT"
+            echo "full_build=true" >> "$GITHUB_OUTPUT"
+            echo "Building all SDK versions (tag push)"
+            exit 0
+          fi
+
+          # Full build every 30 commits
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          if (( COMMIT_COUNT % 30 == 0 )); then
+            echo "ida_versions=$FULL" >> "$GITHUB_OUTPUT"
+            echo "full_build=true" >> "$GITHUB_OUTPUT"
+            echo "Building all SDK versions (commit #$COMMIT_COUNT)"
+            exit 0
+          fi
+
+          # Light build otherwise
+          echo "ida_versions=$LIGHT" >> "$GITHUB_OUTPUT"
+          echo "full_build=false" >> "$GITHUB_OUTPUT"
+          echo "Light build (commit #$COMMIT_COUNT)"
+
+  warm-cache:
+    name: Warm dependency cache (${{ matrix.os }})
+    if: github.event_name == 'push'
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Check caches before installing any tools to skip setup on hit
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.fetchcontent
+          key: fetchcontent-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            fetchcontent-${{ runner.os }}-
+
+      - name: Cache ccache
+        id: ccache-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      # Everything below only runs on cache miss
+      - name: Setup cmake
+        if: steps.ccache-cache.outputs.cache-hit != 'true'
+        uses: jwlawson/actions-setup-cmake@0d6a7d60b009d01c9e7523be22153ff8f19460d3 # v2.2.0
+        with:
+          cmake-version: "latest"
+
+      - name: Install Ninja
+        if: steps.ccache-cache.outputs.cache-hit != 'true'
+        uses: seanmiddleditch/gha-setup-ninja@3b1f8f94a2f8254bd26914c4ab9474d4f0015f67 # v6
+
+      - name: Install ccache
+        if: steps.ccache-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install ccache
+          else
+            sudo apt-get update && sudo apt-get install -y ccache
+          fi
+
+      - name: Set up build caching
+        if: steps.ccache-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "FETCHCONTENT_BASE_DIR=$HOME/.fetchcontent" >> "$GITHUB_ENV"
+
+      - name: Configure ccache
+        if: steps.ccache-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          ccache --set-config=max_size=500M
+          ccache --set-config=compression=true
+          ccache -z
+
+      - name: Install liblzma (Linux)
+        if: ${{ runner.os == 'Linux' && steps.ccache-cache.outputs.cache-hit != 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblzma-dev
+
+      - name: Install liblzma (macOS)
+        if: ${{ runner.os == 'macOS' && steps.ccache-cache.outputs.cache-hit != 'true' }}
+        run: brew install xz
+
+      - name: Install liblzma (Windows)
+        if: ${{ matrix.os == 'windows-latest' && steps.ccache-cache.outputs.cache-hit != 'true' }}
+        run: vcpkg install liblzma:x64-windows
+
+      - name: Configure cmake
+        if: steps.ccache-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          # CMAKE_OSX_ARCHITECTURES is ignored on Linux; on macOS it primes the
+          # cache with universal (arm64 + x86_64) dependency objects.
+          cmake -B build-deps -S "$GITHUB_WORKSPACE" -G Ninja \
+                -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+                -DIDA_VERSION=9.3 \
+                -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+                -DFETCHCONTENT_BASE_DIR="$FETCHCONTENT_BASE_DIR"
+
+      - name: Build
+        if: steps.ccache-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: cmake --build build-deps --config "$BUILD_TYPE"
+
+      - name: Show ccache stats
+        if: ${{ always() && steps.ccache-cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        run: ccache -sv || true
+
+  cpp-tests:
+    name: C++ standalone tests (${{ matrix.os }})
+    needs: [warm-cache]
+    if: ${{ !failure() && !cancelled() }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@0d6a7d60b009d01c9e7523be22153ff8f19460d3 # v2.2.0
+        with:
+          cmake-version: "latest"
+
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@3b1f8f94a2f8254bd26914c4ab9474d4f0015f67 # v6
+
+      - name: Install ccache
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install ccache
+          else
+            sudo apt-get update && sudo apt-get install -y ccache
+          fi
+
+      - name: Set up build caching
+        shell: bash
+        run: |
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "FETCHCONTENT_BASE_DIR=$HOME/.fetchcontent" >> "$GITHUB_ENV"
+
+      - name: Restore FetchContent cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.fetchcontent
+          key: fetchcontent-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            fetchcontent-${{ runner.os }}-
+
+      - name: Restore ccache cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Configure ccache
+        shell: bash
+        run: |
+          ccache --set-config=max_size=500M
+          ccache --set-config=compression=true
+          ccache -z
+
+      - name: Configure cmake
+        shell: bash
+        run: |
+          cmake -B build-tests -S "$GITHUB_WORKSPACE" -G Ninja \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DNO_BUILD=On \
+                -DBUILD_TEST=On \
+                -DFETCHCONTENT_BASE_DIR="$FETCHCONTENT_BASE_DIR"
+
+      - name: Build tests
+        shell: bash
+        run: cmake --build build-tests --config Debug
+
+      - name: Run C++ standalone tests
+        shell: bash
+        run: ctest --test-dir build-tests --output-on-failure
+
+      - name: Show ccache stats
+        if: always()
+        shell: bash
+        run: ccache -sv || true
+
+  ghidra-integration:
+    name: Ghidra integration tests
+    needs: [setup]
+    if: needs.setup.outputs.full_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          lfs: true
+          submodules: false
+
+      - name: Checkout Ghidra submodule
+        run: git submodule update --init third_party/ghidra
+
+      - name: Resolve Ghidra version from submodule
+        id: ghidra-version
+        run: |
+          TAG="$(git -C third_party/ghidra describe --tags --exact-match)"
+          VERSION="$(echo "$TAG" | sed -n 's/^Ghidra_\([0-9]*\.[0-9]*\.[0-9]*\)_build$/\1/p')"
+          if [[ -z "$VERSION" ]]; then
+            echo "Error: tag '$TAG' does not match Ghidra_X.Y.Z_build" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache Ghidra installation
+        id: ghidra-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /opt/ghidra_${{ steps.ghidra-version.outputs.version }}_PUBLIC
+          key: ghidra-${{ steps.ghidra-version.outputs.tag }}
+
+      - name: Download Ghidra
+        if: steps.ghidra-cache.outputs.cache-hit != 'true'
+        run: bash scripts/fetch_ghidra.sh --dest /opt
+
+      - name: Save Ghidra cache
+        if: github.event_name == 'push' && steps.ghidra-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /opt/ghidra_${{ steps.ghidra-version.outputs.version }}_PUBLIC
+          key: ghidra-${{ steps.ghidra-version.outputs.tag }}
+
+      - name: Set Ghidra environment
+        env:
+          GHIDRA_VERSION: ${{ steps.ghidra-version.outputs.version }}
+        run: echo "GHIDRA_INSTALL_DIR=/opt/ghidra_${GHIDRA_VERSION}_PUBLIC" >> "$GITHUB_ENV"
+
+      - name: Build and install extension
+        working-directory: ghidra_extension
+        run: ./gradlew installExtension
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - run: pip install '.[test]'
+
+      - name: Run Ghidra integration tests
+        run: pytest tests/python/tests/ghidra/ -v
+
+  build:
+    needs: [setup, warm-cache]
+    if: ${{ !failure() && !cancelled() }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        ida_sdk: ${{ fromJSON(needs.setup.outputs.ida_versions) }}
+        include:
+          - os: ubuntu-latest
+            ext: so
+          # - os: windows-latest
+          #   ext: dll
+          - os: macos-latest
+            ext: dylib
+        exclude:
+          # We exclude these because ARM libraries were not available in 7.4 and the latest macos runner on GitHub are Mx machines
+          - os: macos-latest
+            ida_sdk: "74"
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Set IDA SDK password
+        if: ${{ contains(fromJSON('["74","77","80","81","82","83","84","85","90","90sp1","91"]'), matrix.ida_sdk) }}
+        env:
+          IDA_SDK: ${{ matrix.ida_sdk }}
+        shell: bash
+        run: |
+          case "$IDA_SDK" in
+            74) echo "IDA_SDK_PASSWORD=${{ secrets.IDA_SDK74_PASSWORD }}" >> "$GITHUB_ENV" ;;
+            77) echo "IDA_SDK_PASSWORD=${{ secrets.IDA_SDK77_PASSWORD }}" >> "$GITHUB_ENV" ;;
+            80) echo "IDA_SDK_PASSWORD=${{ secrets.IDA_SDK80_PASSWORD }}" >> "$GITHUB_ENV" ;;
+            81) echo "IDA_SDK_PASSWORD=${{ secrets.IDA_SDK81_PASSWORD }}" >> "$GITHUB_ENV" ;;
+            82) echo "IDA_SDK_PASSWORD=${{ secrets.IDA_SDK82_PASSWORD }}" >> "$GITHUB_ENV" ;;
+            83) echo "IDA_SDK_PASSWORD=${{ secrets.IDA_SDK83_PASSWORD }}" >> "$GITHUB_ENV" ;;
+            84) echo "IDA_SDK_PASSWORD=${{ secrets.IDA_SDK84_PASSWORD }}" >> "$GITHUB_ENV" ;;
+            85) echo "IDA_SDK_PASSWORD=${{ secrets.IDA_SDK85_PASSWORD }}" >> "$GITHUB_ENV" ;;
+            90) echo "IDA_SDK_PASSWORD=${{ secrets.IDA_SDK90_PASSWORD }}" >> "$GITHUB_ENV" ;;
+            90sp1) echo "IDA_SDK_PASSWORD=${{ secrets.IDA_SDK90sp1_PASSWORD }}" >> "$GITHUB_ENV" ;;
+            91) echo "IDA_SDK_PASSWORD=${{ secrets.IDA_SDK91_PASSWORD }}" >> "$GITHUB_ENV" ;;
+            *) echo "No password defined for this IDA SDK version" && exit 1 ;;
+          esac
+
+      - name: Set cmake IDA option
+        env:
+          IDA_SDK: ${{ matrix.ida_sdk }}
+          IDA_SDK_VERSION: idasdk${{ matrix.ida_sdk }}
+        shell: bash
+        run: |
+          if [[ "$IDA_SDK" =~ ^(7|8|90|91) ]]; then
+            echo "CMAKE_IDA_PARAM=-DIdaSdk_ROOT_DIR=${GITHUB_WORKSPACE}/third_party/${IDA_SDK_VERSION}" >> "$GITHUB_ENV"
+          else
+            echo "CMAKE_IDA_PARAM=-DIDA_VERSION=$IDA_SDK" >> "$GITHUB_ENV"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@0d6a7d60b009d01c9e7523be22153ff8f19460d3 # v2.2.0
+        with:
+          cmake-version: "latest"
+
+      - name: Install Ninja (Linux / MacOS)
+        if: ${{ matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest' }}
+        uses: seanmiddleditch/gha-setup-ninja@3b1f8f94a2f8254bd26914c4ab9474d4f0015f67 # v6
+
+      # -- Dependency caching (abseil + protobuf) --
+      # ccache caches compiled objects; FETCHCONTENT_BASE_DIR ensures all builds
+      # reference sources at the same path so ccache gets hits across SDK versions.
+      # When adding Windows support, use sccache instead of ccache (MSVC compatible).
+
+      - name: Install ccache
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install ccache
+          else
+            sudo apt-get update && sudo apt-get install -y ccache
+          fi
+
+      - name: Set up build caching
+        shell: bash
+        run: |
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "FETCHCONTENT_BASE_DIR=$HOME/.fetchcontent" >> "$GITHUB_ENV"
+
+      - name: Restore FetchContent cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.fetchcontent
+          key: fetchcontent-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            fetchcontent-${{ runner.os }}-
+
+      - name: Restore ccache cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Configure ccache
+        shell: bash
+        run: |
+          ccache --set-config=max_size=500M
+          ccache --set-config=compression=true
+          ccache -z
+
+      - name: Restore IDA SDK cache
+        if: ${{ contains(fromJSON('["74","77","80","81","82","83","84","85","90","90sp1","91"]'), matrix.ida_sdk) }}
+        id: cache-sdk
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: third_party/idasdk${{ matrix.ida_sdk }}
+          key: idasdk-${{ runner.os }}-${{ matrix.ida_sdk }}-${{ hashFiles('sdk_lockfile') }}
+
+      - name: Fetch IDA SDK (Linux / MacOS)
+        if:
+          ${{ steps.cache-sdk.outputs.cache-hit != 'true' &&
+          contains(fromJSON('["74","77","80","81","82","83","84","85","90","90sp1","91"]'), matrix.ida_sdk) &&
+          (matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest') }}
+        env:
+          IDA_SDK: ${{ matrix.ida_sdk }}
+          IDA_SDK_VERSION: idasdk${{ matrix.ida_sdk }}
+        run: |
+          cd scripts
+          ./fetch_sdk.sh "$IDA_SDK"
+          cd ..
+          [ ! -d "third_party/$IDA_SDK_VERSION" ] && unzip -d third_party -P "$IDA_SDK_PASSWORD" "third_party/$IDA_SDK_VERSION.zip"
+          [ -f "third_party/$IDA_SDK_VERSION/include/regex.h" ] && rm "third_party/$IDA_SDK_VERSION/include/regex.h"
+
+      - name: Fetch IDA SDK (Windows)
+        if:
+          ${{ steps.cache-sdk.outputs.cache-hit != 'true' &&
+          contains(fromJSON('["74","77","80","81","82","83","84","85","90","90sp1","91"]'), matrix.ida_sdk) &&
+          matrix.os == 'windows-latest' }}
+        env:
+          IDA_SDK: ${{ matrix.ida_sdk }}
+          IDA_SDK_VERSION: idasdk${{ matrix.ida_sdk }}
+        shell: pwsh
+        run: |
+          cd scripts
+          .\fetch_sdk.bat $env:IDA_SDK
+          cd ..
+          7z.exe x -p"$($env:IDA_SDK_PASSWORD)" -y -o"third_party" "third_party\$($env:IDA_SDK_VERSION).zip"
+          rm "third_party\$($env:IDA_SDK_VERSION)\include\regex.h"
+
+      - name: Save IDA SDK cache
+        if: ${{ steps.cache-sdk.outputs.cache-hit != 'true' && contains(fromJSON('["74","77","80","81","82","83","84","85","90","90sp1","91"]'), matrix.ida_sdk) }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: third_party/idasdk${{ matrix.ida_sdk }}
+          key: idasdk-${{ runner.os }}-${{ matrix.ida_sdk }}-${{ hashFiles('sdk_lockfile') }}
+
+      - name: Install liblzma (Linux)
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblzma-dev
+
+      - name: Install liblzma (MacOS)
+        if: ${{ matrix.os == 'macos-latest' }}
+        run: |
+          brew install xz
+
+      - name: Install liblzma (Windows)
+        if: ${{ matrix.os == 'windows-latest' }}
+        run: |
+          vcpkg install liblzma:x64-windows
+
+      - name: Prepare build environment (Linux)
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        env:
+          CMAKE_BUILD_DIR: build${{ matrix.ida_sdk }}
+        shell: bash
+        run: |
+          cmake -B "$CMAKE_BUILD_DIR" -S "$GITHUB_WORKSPACE" -G Ninja \
+                -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" "$CMAKE_IDA_PARAM" \
+                -DFETCHCONTENT_BASE_DIR="$FETCHCONTENT_BASE_DIR"
+
+      - name: Prepare build environment (MacOS)
+        if: ${{ matrix.os == 'macos-latest' }}
+        env:
+          CMAKE_BUILD_DIR: build${{ matrix.ida_sdk }}
+        shell: bash
+        run: |
+          # Universal (arm64 + x86_64) so a single .dylib runs on Apple Silicon
+          # and Intel hosts (required for the IDA plugin-manager archives).
+          cmake -B "$CMAKE_BUILD_DIR" \
+                -S "$GITHUB_WORKSPACE" \
+                -G Ninja \
+                -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+                "$CMAKE_IDA_PARAM" \
+                -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+                -DFETCHCONTENT_BASE_DIR="$FETCHCONTENT_BASE_DIR"
+
+      - name: Prepare build environment (Windows)
+        if: ${{ matrix.os == 'windows-latest' }}
+        env:
+          IDA_SDK_VERSION: idasdk${{ matrix.ida_sdk }}
+          CMAKE_BUILD_DIR: build${{ matrix.ida_sdk }}
+        shell: bash
+        run: |
+          cmake -B "$CMAKE_BUILD_DIR" -S "$GITHUB_WORKSPACE" -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" "$CMAKE_IDA_PARAM" \
+                ${FETCHCONTENT_BASE_DIR:+"-DFETCHCONTENT_BASE_DIR=$FETCHCONTENT_BASE_DIR"}
+
+      - name: Build
+        env:
+          CMAKE_BUILD_DIR: build${{ matrix.ida_sdk }}
+        shell: bash
+        run: |
+          cmake --build "$CMAKE_BUILD_DIR" --config "$BUILD_TYPE"
+          cmake --install "$CMAKE_BUILD_DIR"
+
+      - name: Prepare artifact
+        env:
+          CMAKE_BUILD_DIR: build${{ matrix.ida_sdk }}
+          IDA_SDK: ${{ matrix.ida_sdk }}
+          EXT: ${{ matrix.ext }}
+        shell: bash
+        run: |
+          cp "$CMAKE_BUILD_DIR/quokka-install/quokka_plugin.${EXT}" "${IDA_SDK}-quokka_plugin.${EXT}"
+
+      - name: Show ccache stats
+        if: always()
+        shell: bash
+        run: ccache -sv || true
+
+      # We need one action per file
+      # See https://github.com/actions/upload-artifact/issues/331
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: idaplugin-${{ matrix.os }}-${{ matrix.ida_sdk }}
+          path: ${{ matrix.ida_sdk }}-quokka_plugin.${{ matrix.ext }}
+          if-no-files-found: error
+
+
+  upload:
+    name: Upload artifacts for Release
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        ida_sdk: [74, 77, 80, 81, 82, 83, 84, 85, 90, 90sp1, 91, 9.2, 9.3]
+        include:
+          - os: ubuntu-latest
+            ext: so
+          - os: macos-latest
+            ext: dylib
+        exclude:
+          - os: macos-latest
+            ida_sdk: 74
+
+    steps:
+      - name: Download Artefact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: idaplugin-${{ matrix.os }}-${{ matrix.ida_sdk }}
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          IDA_SDK: ${{ matrix.ida_sdk }}
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=( "${IDA_SDK}"-quokka_* )
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "::error::No matching files found" && exit 1
+          fi
+          gh release upload "$TAG_NAME" "${files[@]}" --clobber
+  # Package the IDA >= 9.1 plugins for the Hex-Rays plugin manager / marketplace.
+  # This does NOT recompile: it reuses the binaries already built by the `build`
+  # job, repackaging them into one quokka-ida<version>.zip per IDA version
+  # (each containing the Linux + macOS-universal plugin plus an ida-plugin.json
+  # manifest) and attaching them to the release.
+  package-plugin:
+    name: Package for IDA plugin manager
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download plugin artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+
+      - name: Assemble plugin-manager archives
+        shell: bash
+        run: |
+          # Map the build matrix SDK token -> the dotted IDA version advertised
+          # in the manifest. Only IDA >= 9.1 is supported by the plugin manager.
+          declare -A VERSIONS=( ["91"]="9.1" ["9.2"]="9.2" ["9.3"]="9.3" )
+          for token in "${!VERSIONS[@]}"; do
+            ver="${VERSIONS[$token]}"
+            echo "Packaging IDA ${ver} (build token ${token})"
+
+            linux="artifacts/idaplugin-ubuntu-latest-${token}/${token}-quokka_plugin.so"
+            macos="artifacts/idaplugin-macos-latest-${token}/${token}-quokka_plugin.dylib"
+            if [[ ! -e "$linux" || ! -e "$macos" ]]; then
+              echo "::error::Missing plugin binaries for IDA ${ver} (token ${token})"
+              exit 1
+            fi
+
+            stage="stage-${ver}"
+            # Restore the plugin-manager entry-point name (no "64" suffix).
+            cp "$linux" "$stage/quokka_plugin.so"
+            cp "$macos" "$stage/quokka_plugin.dylib"
+            cp README.md "$stage/README.md"
+            cp docs/img/logo.png "$stage/logo.png"
+            # Pin this archive's manifest to the exact IDA version.
+            jq ".plugin.idaVersions = \"==${ver}\"" ida-plugin.json > "$stage/ida-plugin.json"
+
+            ( cd "$stage" && zip -r "../quokka-ida${ver}.zip" . )
+          done
+
+      - name: Upload archives to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=( quokka-ida*.zip )
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "::error::No plugin archives found" && exit 1
+          fi
+          gh release upload "$TAG_NAME" "${files[@]}" --clobber

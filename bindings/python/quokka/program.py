@@ -1,0 +1,1449 @@
+"""Program
+
+This is the main class of Quokka.
+It deals with the most common abstraction, the Program.
+"""
+
+#  Copyright 2022-2023 Quarkslab
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      https://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
+from __future__ import annotations
+
+from functools import cached_property
+from itertools import product
+import logging
+import os
+import sys
+import shutil
+import re
+import subprocess
+from pathlib import Path
+from typing import TYPE_CHECKING, Type, Iterable
+import lzma
+
+import capstone
+import networkx
+try:
+    import idascript
+except ImportError:
+    idascript = None  # type: ignore[assignment]
+
+import quokka
+import quokka.analysis
+import quokka.backends
+from quokka.quokka_pb2 import Quokka as Pb # pyright: ignore[reportMissingImports]
+from quokka.data_type import (
+    ComplexType,
+    EnumTypeMember,
+    StructureTypeMember,
+    BaseType,
+    ArrayType,
+    PointerType,
+    StructureType,
+    EnumType,
+    TypedefType,
+    TypeReference,
+    UnionType,
+    TypeT
+)
+import hashlib
+from quokka.types import (
+    AddressT,
+    Disassembler,
+    Endianness,
+    ExporterMode,
+    FunctionType,
+    Index,
+    CallingConvention
+)
+from quokka.exc import QuokkaError, StaleIDBError
+
+
+if TYPE_CHECKING:
+    import pypcode
+
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_ghidra_application_properties(ghidra_dir: Path) -> dict[str, str]:
+    """Parse Ghidra's application.properties into a dict."""
+
+    props_file = ghidra_dir / "Ghidra" / "application.properties"
+    props: dict[str, str] = {}
+    if not props_file.exists():
+        return props
+    for line in props_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, _, value = line.partition("=")
+            props[key.strip()] = value.strip()
+    return props
+
+
+def _get_ghidra_versioned_name(ghidra_dir: Path) -> str | None:
+    """Return the versioned settings directory name (e.g. 'ghidra_12.0.4_PUBLIC')."""
+
+    props = _parse_ghidra_application_properties(ghidra_dir)
+    version = props.get("application.version")
+    release = props.get("application.release.name")
+    if not version or not release:
+        return None
+    name = props.get("application.name", "Ghidra").lower().replace(" ", "")
+    return f"{name}_{version}_{release}"
+
+
+def _get_ghidra_user_extensions_dir(ghidra_dir: Path) -> Path | None:
+    """Compute the user settings Extensions dir (where the GUI installs extensions).
+
+    Mirrors Ghidra's ``ApplicationUtilities.getDefaultUserSettingsDir()`` logic.
+
+    Does not handle the ``-Dapplication.settingsdir`` JVM system property (not
+    readable from Python).
+
+    Returns None if application.properties cannot be parsed.
+    """
+
+    versioned = _get_ghidra_versioned_name(ghidra_dir)
+    if versioned is None:
+        return None
+
+    import getpass
+    import platform
+    system = platform.system()
+    home = Path.home()
+    app_name = "ghidra"
+
+    # Ghidra prepends "<user>-" when the parent dir is outside $HOME
+    # (see getUserSpecificDirName in ApplicationUtilities.java).
+    def _user_specific_name(parent: Path) -> str:
+        try:
+            parent.resolve().relative_to(home.resolve())
+            return app_name
+        except ValueError:
+            return f"{getpass.getuser()}-{app_name}"
+
+    # Priority 1: XDG_CONFIG_HOME (checked on all platforms per Ghidra source)
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        xdg_path = Path(xdg)
+        return xdg_path / _user_specific_name(xdg_path) / versioned / "Extensions"
+
+    # Priority 2: platform default
+    if system == "Darwin":
+        base = home / "Library"
+    elif system == "Windows":
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return None
+        base = Path(appdata)
+    else:  # Linux, FreeBSD, etc.
+        base = home / ".config"
+
+    return base / app_name / versioned / "Extensions"
+
+
+def _find_ghidra_extension(ghidra_dir: Path) -> Path | None:
+    """Find the QuokkaExporter extension directory.
+
+    Checks both the Ghidra install dir (Gradle install) and the user settings
+    dir (GUI install). Returns the path to the QuokkaExporter directory,
+    or None if not found.
+
+    Logs a warning if the extension is found in both locations (duplicate
+    installs can cause class-loading conflicts).
+    """
+
+    install_ext = ghidra_dir / "Ghidra" / "Extensions" / "QuokkaExporter"
+    found_gradle = (install_ext / "extension.properties").exists()
+
+    user_ext = None
+    found_gui = False
+    if (user_ext_dir := _get_ghidra_user_extensions_dir(ghidra_dir)) is not None:
+        user_ext = user_ext_dir / "QuokkaExporter"
+        if (user_ext / "extension.properties").exists() and not (user_ext / "extension.properties.uninstalled").exists():
+            found_gui = True
+
+    if found_gradle and found_gui:
+        logger.warning(
+            "QuokkaExporter found in BOTH the Ghidra install dir and user "
+            "settings dir. This may cause class-loading conflicts.\n"
+            f"  Install dir: {install_ext}\n"
+            f"  User dir:    {user_ext}\n"
+            "Remove one to avoid issues."
+        )
+
+    if found_gradle:
+        return install_ext
+    if found_gui:
+        return user_ext
+    return None
+
+
+class Program(dict):
+    """Program
+
+    The program is `quokka` main abstraction.
+    It represents the full binary and is in itself a mapping of functions.
+
+    Arguments:
+        export_file: Path towards the export file (e.g. .quokka)
+        exec_path: Path towards the binary file
+
+    Attributes:
+        proto: Contains the protobuf data. This should not be used directly. However, if
+            you don't find another way of accessing some information, feel  free to
+            open an issue.
+        export_file: The path to the export file (e.g. the .quokka)
+        mode: Export mode (LIGHT, NORMAL or FULL)
+        base_address: Program base address
+        isa: Instruction set
+        address_size: Default pointer size
+        arch: Program architecture
+        endianness: Program endianness
+        executable: An object to manage the binary file
+        references: The reference manager
+        data: The data manager
+        fun_names: A mapping of function names to functions
+
+    Raises:
+        QuokkaError: If the loading is not successful.
+
+    """
+
+    logger: logging.Logger = logging.getLogger(__name__)
+
+    def __init__(self, export_file: Path|str, exec_path: Path|str):
+        """Constructor"""
+        super(dict, self).__init__()
+
+        self.proto: quokka.pb.Quokka = quokka.pb.Quokka()
+        self.export_file: Path = Path(export_file)
+        try:
+            with lzma.open(self.export_file, "rb") as fd:
+                raw_data = fd.read()
+        except lzma.LZMAError:
+            # try reading it as a plain-bytes Quokka (but should raise version mismatch later)
+            with open(self.export_file, "rb") as fd:
+                raw_data = fd.read()
+
+        self.proto.ParseFromString(raw_data)
+
+        # Export mode
+        self.mode: ExporterMode = ExporterMode.from_proto(self.proto.exporter_meta.mode)
+
+        # Version checking
+        # A change in the major version might break backward compatibility
+        proto_version = quokka.parse_version(self.proto.exporter_meta.version)
+        current_version = quokka.parse_version(quokka.__version__)
+        if proto_version[0] != current_version[0]:
+            self.logger.warning(
+                "The exported file has been generated by a different version of Quokka."
+                f" The file has been generated by Quokka {self.proto.exporter_meta.version}"
+                f" while you are using {quokka.__version__}"
+            )
+        elif self.proto.exporter_meta.version != quokka.__version__:
+            self.logger.debug(
+                "Version mismatch detected but still compatible with the exported file."
+                f" The file has been generated by Quokka {self.proto.exporter_meta.version}"
+                f" while you are using {quokka.__version__}"
+            )
+
+        # Check if the hashes matches between the export file and the exec
+        if not quokka.check_hash(self.proto.meta.hash, Path(exec_path)):
+            self.logger.error("Hash does not match with file.")
+            raise quokka.QuokkaError("Hash mismatch")
+
+        self.isa: quokka.analysis.ArchEnum = quokka.get_isa(self.proto.meta.isa)
+        self.address_size: int = quokka.convert_address_size(
+            self.proto.meta.address_size
+        )
+        self.arch: Type[quokka.analysis.QuokkaArch] = quokka.get_arch(
+            self.isa, self.address_size
+        )
+
+        self.endianness: Endianness = Endianness.from_proto(self.proto.meta.endianess)
+
+        # Get disassembly backend
+        self.disassembler: Disassembler = Disassembler.from_proto(self.proto.meta.backend.name) 
+        self.disassembler_version: str = self.proto.meta.backend.version
+        self.decompiled_activated: bool = self.proto.meta.decompilation_activated
+
+        self.calling_convention: CallingConvention = CallingConvention.from_proto(self.proto.meta.calling_convention)
+
+        self.executable = quokka.Executable(exec_path, self.endianness)
+        self.data = quokka.DataHolder(self.proto, self)
+
+        # Functions
+        # self.functions: Dict[int, quokka.Function] = {}
+        self.fun_names: dict[str, quokka.Function] = {}
+        for func_index, func in enumerate(self.proto.functions):
+            function = quokka.Function(func_index, func, self)
+            self[function.start] = function
+            if function.name not in self.fun_names:
+                self.fun_names[function.name] = function
+            else:
+                if function.type == self.fun_names[function.name]:
+                    self.logger.warning("Found two functions with the same name.")
+                else:
+                    if function.type == FunctionType.NORMAL:
+                        self.fun_names[function.name] = function
+
+        # Types
+        self._types: dict[Index, TypeT] = {}  # types as they are being loaded
+
+    def __hash__(self) -> int:
+        """Hash of the Program (use the hash from the exported file)"""
+        return int(self.proto.meta.hash.hash_value, 16)
+
+    @property
+    def base_address(self) -> AddressT:
+        """Program base address"""
+        return min(segment.start for segment in self.segments.values())
+
+    @property
+    def name(self) -> str:
+        """Returns the underlying binary name"""
+        return self.proto.meta.executable_name
+
+    @property
+    def hash(self) -> str:
+        """Returns the hash value of the binary (either sha256 or MD5)."""
+        return self.proto.meta.hash.hash_value
+
+    @property
+    def headers(self) -> str:
+        """Returns C-style headers of the binary"""
+        return self.proto.headers
+
+    @cached_property
+    def capstone(self) -> capstone.Cs:
+        """Compute a capstone context"""
+        return quokka.backends.get_capstone_context(self.arch, self.endianness)
+
+    @cached_property
+    def call_graph(self) -> networkx.DiGraph:
+        """Compute the Call Graph of the binary
+
+        Every node in the call graph is a function.
+
+        :return: A Call Graph (a networkx DiGraph)
+        """
+        call_graph: "networkx.DiGraph" = networkx.DiGraph()
+
+        for function in self.values():
+            call_graph.add_node(function.start)
+            call_graph.add_edges_from(product((function.start,), (x.start for x in function.callees)))
+            
+        return call_graph
+
+    @property
+    def functions(self) -> Iterable[quokka.Function]:
+        """Functions accessor
+
+        Allows to retrieve the different functions of a program (as defined by the
+        disassembler).
+
+        Returns:
+            A list of functions
+        """
+        yield from self.values()
+
+    @property
+    def types(self) -> Iterable[TypeT]:
+        """Types in the program
+
+        Returns:
+            Iterable of types in the Program (excludes user-added types)
+        """
+        for i, pb_type in enumerate(self.proto.types):
+            if not pb_type.is_new:
+                yield self.get_type(i)
+
+    def virtual_address(self, seg_id: int, seg_offset: int) -> AddressT:
+        """Converts an offset in the file to an absolute address
+
+        Arguments:
+            seg_id: Segment ID
+            seg_offset: Byte offset in the segment
+
+        Returns:
+            An absolute address
+        """
+        return self.segments[seg_id].address + seg_offset
+
+    def address_to_offset(self, address: AddressT) -> int:
+        """Converts a program offset to a file offset.
+
+        Arguments:
+            address: A virtual address
+            
+        Returns:
+            A file offset
+        """
+        try:
+            segment = self.get_segment(address)
+        except KeyError as exc:
+            raise quokka.NotInFileError("Unable to find the segment") from exc
+
+        if segment.file_offset != -1:
+            return address - segment.address + segment.file_offset
+
+        raise quokka.NotInFileError("Unable to find the offset in the file")
+
+    @cached_property
+    def pypcode(self) -> pypcode.Context:
+        """Generate the Pypcode context."""
+        from quokka.backends.pypcode import get_pypcode_context
+
+        return get_pypcode_context(self.arch, self.endianness)
+
+    @property
+    def structures(self) -> Iterable[StructureType]:
+        """Structures accessor
+
+        Allows to retrieve the different structures of a program (as defined by the
+        disassembler).
+
+        Returns:
+            A list of structures
+        """
+        for i, t in enumerate(self.proto.types):
+            if t.is_new:
+                continue
+            if t.WhichOneof("OneofType") == "composite_type":
+                if t.composite_type.type == Pb.CompositeType.CompositeSubType.TYPE_STRUCT:
+                    if i not in self._types:
+                        self._types[i] = StructureType(i, t.composite_type, self)
+        yield from (t for t in self._types.values() if isinstance(t, StructureType) and not t.is_new)
+
+    @cached_property
+    def enums(self) -> Iterable[EnumType]:
+        """Enums accessor
+
+        Allows to retrieve the different enums of a program (as defined by the
+        disassembler).
+
+        Returns:
+            A list of enums
+        """
+        for i, t in enumerate(self.proto.types):
+            if t.is_new:
+                continue
+            if t.WhichOneof("OneofType") == "enum_type":
+                if i not in self._types:
+                    self._types[i] = EnumType(i, t.enum_type, self)
+        yield from (t for t in self._types.values() if isinstance(t, EnumType) and not t.is_new)
+
+    def get_struct_member(self, struct_index: Index, member_index: Index) -> StructureTypeMember:
+        """Get a structure member by its index
+
+        Arguments:
+            struct_index: Index of the structure in the proto
+            member_index: Index of the member in the structure (starting from 0)
+
+        Returns:
+            The corresponding structure member
+
+        Raises:
+            KeyError: When the structure or the member is not found
+        """
+        try:
+            struct = self._types[struct_index]
+            assert isinstance(struct, StructureType)
+            return struct[member_index]
+        except KeyError as exc:
+            raise KeyError(f"No structure or member with index {struct_index}") from exc
+
+    def get_item(self, addr: AddressT) -> quokka.Function | quokka.Instruction:
+        """Get a function, block or instruction by its address
+
+        Arguments:
+            addr: Address to query
+
+        Returns:
+            A function, block or instruction at the address
+
+        Raises:
+            KeyError: When no item is found at the address
+        """
+        try:
+            return self[addr]
+        except KeyError as exc:
+            raise KeyError(f"No item at address 0x{addr:x}") from exc
+
+    def get_type_reference(self, type_index: Index, member_index: int = -1) -> TypeReference:
+        """Get a type by its index
+
+        Arguments:
+            type_index: Index of the type in the proto
+            member_index: Index of the member in the type (if applicable)
+
+        Returns:
+            The corresponding type
+
+        Raises:
+            KeyError: When the type is not found or is a user-added type
+        """
+        try:
+            typ = self._types[type_index]
+        except KeyError:
+            # Unless fill the type from the protobuf
+            if type_index >= len(self.proto.types):
+                raise KeyError(f"No type with index {type_index}")
+
+            pb_type = self.proto.types[type_index]
+            if pb_type.is_new:
+                raise KeyError(f"Type at index {type_index} is a user-added type")
+            is_new = pb_type.is_new
+            if pb_type.WhichOneof("OneofType") == "enum_type":
+                self._types[type_index] = EnumType(type_index, pb_type.enum_type, self, is_new=is_new)
+            elif pb_type.WhichOneof("OneofType") == "composite_type":
+                match pb_type.composite_type.type:
+                    case Pb.CompositeType.CompositeSubType.TYPE_STRUCT:
+                        self._types[type_index] = StructureType(type_index, pb_type.composite_type, self, is_new=is_new)
+                    case Pb.CompositeType.CompositeSubType.TYPE_UNION:
+                        self._types[type_index] = UnionType(type_index, pb_type.composite_type, self, is_new=is_new)
+                    case Pb.CompositeType.CompositeSubType.TYPE_ARRAY:
+                        self._types[type_index] = ArrayType(type_index, pb_type.composite_type, self, is_new=is_new)
+                    case Pb.CompositeType.CompositeSubType.TYPE_POINTER:
+                        self._types[type_index] = PointerType(type_index, pb_type.composite_type, self, is_new=is_new)
+                    case Pb.CompositeType.CompositeSubType.TYPE_TYPEDEF:
+                        self._types[type_index] = TypedefType(type_index, pb_type.composite_type, self, is_new=is_new)
+                    case _:
+                        # Unknown CompositeSubType -- degrade to TYPE_UNK for forward compat
+                        self._types[type_index] = BaseType.UNKNOWN
+            elif pb_type.WhichOneof("OneofType") == "primitive_type":
+                self._types[type_index] = BaseType.from_proto(pb_type.primitive_type)
+            else:
+                assert False, "Unknown type"
+            typ = self._types[type_index]  # here should be loaded in _types
+
+        if isinstance(typ, ComplexType) and typ.is_new:
+            raise KeyError(f"Type at index {type_index} is a user-added type")
+
+        if member_index != -1:
+            assert isinstance(typ, (StructureType, UnionType, EnumType))
+            if isinstance(typ, StructureType) and not isinstance(typ, UnionType):
+                return typ.member_at(member_index)
+            return typ[member_index]
+        else:
+            return typ
+
+    def get_type(self, type_index: Index, member_index: int = -1) -> TypeT:
+        """Get a type by its index with strict typing.
+           For struct or enum members, returns the underlying type.
+
+        Arguments:
+            type_index: Index of the type in the proto
+
+        Returns:
+            The corresponding type
+
+        Raises:
+            KeyError: When the type is not found
+            ValueError: When the type is not of the expected type
+        """
+        typ = self.get_type_reference(type_index, member_index)
+        if isinstance(typ, EnumTypeMember):
+            return typ.base_type
+        elif isinstance(typ, StructureTypeMember):
+            return typ.type   # A member cannot point to another member, so it must be a direct reference to a type
+        else:
+            return typ
+
+    def find_type(self, name: str) -> TypeT|None:
+        """Find a type by its name
+
+        Arguments:
+            name: Name of the type to find
+
+        Returns:
+            The corresponding type, None if not found
+        """
+        for t in self.types:
+            if t.name == name:
+                return t
+        return None
+
+    def get_type_resolved(self, type_index: Index) -> TypeT:
+        """Get a type by index, resolving through any typedef chains.
+
+        This is equivalent to calling get_type() and then resolve() on the
+        result if it is a TypedefType. Useful for consumers that do not care
+        about typedef names and want the concrete type directly.
+        """
+        t = self.get_type(type_index)
+        while isinstance(t, TypedefType):
+            t = t.aliased_type
+        return t
+
+    def add_type(self, type: str) -> None:
+        """Add a new user-defined type to the program.
+
+        Args:
+            type: A C type declaration string
+                (e.g. ``"struct foo { int x; float y; }"``).
+
+        Raises:
+            QuokkaError: If a type with the same name already exists.
+        """
+
+        h = hashlib.sha256(type.encode("utf-8", errors="replace")).hexdigest()[:16]
+        type_name = f"__user_type_{h}"
+        new_index = len(self.proto.types)
+        pb_type = self.proto.types.add()
+        pb_type.is_new = True
+        ct = pb_type.composite_type
+        ct.name = type_name
+        ct.type = Pb.CompositeType.TYPE_STRUCT
+        ct.c_str = type
+
+        # Check for duplicate names
+        for i, t in enumerate(self.proto.types):
+            if i == new_index:
+                continue
+            oneof = t.WhichOneof("OneofType")
+            if oneof == "composite_type" and t.composite_type.name == type_name:
+                # Remove the just-added entry
+                del self.proto.types[new_index]
+                raise QuokkaError(f"Type '{type_name}' already exists at index {i}")
+            elif oneof == "enum_type" and t.enum_type.name == type_name:
+                del self.proto.types[new_index]
+                raise QuokkaError(f"Type '{type_name}' already exists at index {i}")
+
+    @cached_property
+    def orphaned_blocks(self) -> Iterable[quokka.Block]:
+        """Orphaned blocks
+
+        Orphaned blocks are blocks that are not attached to any function. They can be
+        useful to analyze code that is not in functions (e.g. hand-written assembly or
+        jump tables).
+
+        Returns:
+            A list of orphaned blocks.
+        """
+        raise NotImplementedError("Orphaned blocks loading is not implemented yet")
+
+    @cached_property
+    def segments(self) -> dict[int, quokka.Segment]:
+        """Returns the list of segments defined in the program."""
+        return {i: quokka.Segment(segment, self) for i, segment in enumerate(self.proto.segments)}
+
+    def get_instruction(self, address: AddressT) -> quokka.Instruction:
+        """Get an instruction by its address
+
+        Note: the address must be the head of the instruction.
+
+        Arguments:
+            address: AddressT: Address to query
+
+        Returns:
+            A `quokka.Instruction`
+
+        Raises:
+            IndexError: When no instruction is found at this address
+        """
+        for function in self.values():
+            if function.in_function(address):
+                try:
+                    return function.get_instruction(address)
+                except IndexError:
+                    pass
+
+        raise IndexError(f"No instruction at address 0x{address:x}")
+
+    def find_function_by_address(self, address: AddressT) -> quokka.Function|None:
+        """Get a function by any address.
+
+        Arguments:
+            address: AddressT: within the function
+
+        Returns:
+            A `quokka.Function` None if not belonging to any function
+        """
+        if address in self:
+            return self[address]
+        else:
+            # try finding it in the functions
+            for function in self.values():
+                if function.in_function(address):
+                    return function
+        return None
+
+    def get_function(
+        self, name: str, approximative: bool = False, normal: bool = False
+    ) -> quokka.Function:
+        """Find a function in a program by its name
+
+        Arguments:
+            name: Function name
+            approximative: Should the name exactly match or allow partial matches?
+            normal: Return only FunctionType.NORMAL functions
+
+        Returns:
+            A function matching the research criteria
+
+        Raises:
+            ValueError: When no function is found
+        """
+        if approximative is False:
+            try:
+                return self.fun_names[name]
+            except KeyError as exc:
+                raise ValueError("Missing function") from exc
+
+        for function_name, function in self.fun_names.items():
+            # TODO(dm) Improve this
+            if name in function.name and (
+                not normal or function.type == FunctionType.NORMAL
+            ):
+                return self.fun_names[function_name]
+
+        raise ValueError("Unable to find an appropriate function")
+
+    def get_segment(self, address: AddressT) -> quokka.Segment:
+        """Get a `Segment` by an address
+
+        The address must be in [segment.start, segment.end) to be found.
+
+        Arguments:
+            address: Segment's address
+
+        Returns:
+            The corresponding Segment
+
+        Raises:
+            KeyError: When the segment is not found
+        """
+        for _, segment in self.segments.items():
+            if segment.in_segment(address):
+                return segment
+
+        raise KeyError(f"No segment has been found for address {address:#x}")
+
+    def read_bytes(self, v_addr: AddressT, size: int) -> bytes:
+        """Read raw bytes from a virtual address
+
+        Arguments:
+            v_addr: Virtual address of the data to read
+            size: Size of the data to read
+
+        Returns:
+            The raw data at the specified address
+        """
+
+        if (offset := v_addr - self.base_address) < 0:
+            raise ValueError("Address outside virtual address space.")
+        return self.executable.read_bytes(offset, size)
+
+    def get_data(self, address: AddressT) -> quokka.Data:
+        """Get data by address
+
+        Arguments:
+            address: Address to query
+
+        Returns:
+            A data at the address
+
+        Raises:
+            ValueError: When no data is found at the address
+        """
+        return self.data[address]
+
+    def __repr__(self) -> str:
+        """Program representation"""
+        return self.__str__()
+
+    def __str__(self) -> str:
+        """Program representation"""
+        return f"<Program {self.executable.exec_file.name} ({self.arch.__name__})>"
+
+    @staticmethod
+    def from_binary(
+        exec_path: Path|str,
+        output_file: Path|str|None = None,
+        database_file: Path|str|None = None,
+        decompiled: bool = False,
+        debug: bool = False,
+        override: bool = True,
+        timeout: int|None = 0,
+        mode: ExporterMode = ExporterMode.LIGHT,
+        disassembler: Disassembler = Disassembler.UNKNOWN,
+    ) -> Program|None:
+        """Generate an export file directly from the binary.
+
+        Arguments:
+            exec_path: Binary to export.
+            output_file: Where to store the result (by default: near the executable)
+            database_file: Where to store IDA database (by default: near the executable)
+            decompiled: Whether to export decompiled code (default: False)
+            timeout: How long should we wait for the export to finish (default: 10 min)
+            debug: Activate the debug output
+            mode: Export mode (LIGHT or FULL)
+            disassembler: Backend to use (auto-detect if UNKNOWN)
+
+        Returns:
+            A Program instance or None
+
+        Raises:
+            QuokkaError: If the export fails
+            FileNotFoundError: If the executable is not found
+        """
+        quokka_file = Program.generate(
+            exec_path=exec_path,
+            output_file=output_file,
+            database_file=database_file,
+            decompiled=decompiled,
+            override=override,
+            debug=debug,
+            timeout=timeout,
+            mode=mode,
+            disassembler=disassembler,
+        )
+
+        # In theory if reach here export file exists otherwise an exception has been raised
+        if quokka_file.exists():
+            return Program.open(quokka_file, exec_path)
+        else:
+            raise FileNotFoundError(f"Quokka generation failed, export file does not exist: {quokka_file}")
+
+
+    @staticmethod
+    def open(export_file: Path|str, exec_file: Path|str) -> Program:
+        """
+        Open a BinExport file and return an instance of Program.
+
+        :param export_file: BinExport file path
+        :param exec_file: Path to the executable file
+        :return: an instance of Program
+        """
+        return Program(export_file, exec_file)
+
+    @staticmethod
+    def _detect_disassembler() -> Disassembler:
+        """Auto-detect an available disassembler backend.
+
+        Prefers IDA if ``idascript`` is importable and ``IDA_PATH`` is set,
+        otherwise falls back to Ghidra if ``GHIDRA_INSTALL_DIR`` is set.
+        """
+        if idascript is not None and idascript.get_ida_path():
+            return Disassembler.IDA
+        if os.environ.get("GHIDRA_INSTALL_DIR"):
+            return Disassembler.GHIDRA
+        return Disassembler.UNKNOWN
+
+    @staticmethod
+    def _generate_ida(
+        exec_path: Path,
+        output_file: Path,
+        database_file: Path|str|None,
+        decompiled: bool,
+        debug: bool,
+        timeout: int|None,
+        mode: ExporterMode,
+    ) -> Path:
+        """Run IDA headless export."""
+        if idascript is None:
+            raise QuokkaError(
+                "idascript is not installed. Install it or use Ghidra backend."
+            )
+
+        stale_extensions = (".id0", ".id1", ".id2", ".til", ".nam")
+        stale_files = [
+            exec_path.parent / f"{exec_path.name}{ext}"
+            for ext in stale_extensions
+            if (exec_path.parent / f"{exec_path.name}{ext}").is_file()
+        ]
+        if stale_files:
+            names = ", ".join(f.name for f in stale_files)
+            raise StaleIDBError(
+                f"Stale IDA database files found next to the binary: {names}\n"
+                "These files prevent IDA from opening the binary in "
+                "autonomous mode.\n"
+                "Please delete them before re-exporting."
+            )
+
+        exec_file = exec_path
+        if database_file is None:
+            database_file = exec_file.parent / f"{exec_file.name}.i64"
+        else:
+            database_file = Path(database_file)
+
+        if not database_file.is_file():
+            database_path = database_file.with_suffix("")
+        else:
+            exec_path = database_file
+            database_path = None
+
+        ida = idascript.IDA(
+            exec_path,
+            script_file=None,
+            script_params=[
+                "QuokkaAuto:true",
+                f"QuokkaDecompiled:{str(decompiled).lower()}",
+                f"QuokkaMode:{mode.name}",
+                f"QuokkaFile:{output_file}"],
+            database_path=database_path,
+            timeout=timeout,
+        )
+        ida.start()
+        if (ret_code := ida.wait()) == idascript.IDA.TIMEOUT_RETURNCODE:
+            Program.logger.error(
+                f"Failed to export the binary {exec_path}. IDA timeout of {timeout}s reached."
+            )
+        elif ret_code != 0:
+            Program.logger.error(
+                f"Failed to export the binary {exec_path}. IDA returned code {ret_code}."
+            )
+
+        if debug:
+            Program.logger.debug(f"IDA returned code {ret_code}")
+            Program.logger.debug(ida.stderr.read().decode("utf-8"))
+
+        if ret_code:  # Everything but 0 is an error
+            raise QuokkaError(
+                f"IDA failed to export the binary {exec_path}. "
+                f"IDA returned code {ret_code}."
+            )
+
+        return output_file
+
+    @staticmethod
+    def _generate_ghidra(
+        exec_path: Path,
+        output_file: Path,
+        database_file: Path|str|None,
+        debug: bool,
+        timeout: int|None,
+        mode: ExporterMode,
+    ) -> Path:
+        """Run Ghidra headless export."""
+        import subprocess
+        import tempfile
+
+        env_dir = os.environ.get("GHIDRA_INSTALL_DIR")
+        if not env_dir:
+            raise QuokkaError(
+                "Ghidra not found. Set the GHIDRA_INSTALL_DIR environment variable."
+            )
+        ghidra_dir = Path(env_dir)
+
+        analyze_headless = ghidra_dir / "support" / "analyzeHeadless"
+        if not analyze_headless.exists():
+            raise QuokkaError(
+                f"analyzeHeadless not found at {analyze_headless}"
+            )
+
+        # Find the installed extension (checks both install dir and user
+        # settings dir for GUI installs).
+        ext_path = _find_ghidra_extension(ghidra_dir)
+        if ext_path is None:
+            raise QuokkaError(
+                "QuokkaExporter extension not found. Install it from https://github.com/quarkslab/quokka/tree/main/ghidra_extension"
+            )
+
+        # Locate the headless export script.
+        # Search order: installed extension dir, then repo source tree.
+        script_path = None
+        scripts_dir = ext_path / "ghidra_scripts"
+        if (scripts_dir / "QuokkaExportHeadless.java").exists():
+            script_path = scripts_dir
+        if script_path is None:
+            # Fall back to repo source tree (works for dev installs)
+            repo_script = (
+                Path(__file__).resolve().parent.parent.parent.parent
+                / "ghidra_extension" / "src" / "script" / "ghidra_scripts"
+            )
+            if (repo_script / "QuokkaExportHeadless.java").exists():
+                script_path = repo_script
+        if script_path is None:
+            raise QuokkaError(
+                "QuokkaExportHeadless.java not found. Install the Ghidra "
+                "extension or run from the quokka source tree."
+            )
+
+        # Map ExporterMode to Ghidra script mode names
+        ghidra_mode = "LIGHT" if mode == ExporterMode.LIGHT else "SELF_CONTAINED"
+
+        if database_file is None:
+            proj_dir = Path(tempfile.mkdtemp(prefix="quokka_ghidra_"))
+            project_name = "QuokkaTmp"
+            use_existing_project = False
+            cleanup_project = True
+        else:
+            database_path = Path(database_file)
+            if database_path.suffix == ".gpr":
+                proj_dir = database_path.parent
+                project_name = database_path.stem
+            else:
+                proj_dir = database_path
+                gpr_files = sorted(proj_dir.glob("*.gpr")) if proj_dir.is_dir() else []
+                project_name = gpr_files[0].stem if len(gpr_files) == 1 else exec_path.stem
+            use_existing_project = (proj_dir / f"{project_name}.gpr").exists()
+            cleanup_project = False
+
+        try:
+            cmd = [
+                str(analyze_headless),
+                str(proj_dir),
+                project_name,
+            ]
+            if use_existing_project:
+                cmd.extend(["-process", exec_path.name])
+            else:
+                cmd.extend(["-import", str(exec_path)])
+            cmd.extend([
+                "-scriptPath", str(script_path),
+                "-postScript", "QuokkaExportHeadless.java",
+                f"--out={output_file}",
+                f"--mode={ghidra_mode}",
+            ])
+            if not use_existing_project:
+                cmd.append("-readOnly")
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout if timeout else None,
+            )
+
+            if debug:
+                Program.logger.debug(
+                    f"Ghidra returned code {result.returncode}"
+                )
+                Program.logger.debug(result.stderr[-2000:] if result.stderr else "")
+
+            if result.returncode != 0:
+                raise QuokkaError(
+                    f"Ghidra failed to export {exec_path} "
+                    f"(rc={result.returncode}):\n"
+                    f"{result.stderr[-2000:] if result.stderr else ''}"
+                )
+
+            if not output_file.exists():
+                raise QuokkaError(
+                    f"Ghidra export did not produce {output_file}.\n"
+                    f"{result.stdout[-2000:] if result.stdout else ''}"
+                )
+        finally:
+            if cleanup_project:
+                shutil.rmtree(proj_dir, ignore_errors=True)
+
+        return output_file
+
+    @staticmethod
+    def generate(
+        exec_path: Path|str,
+        output_file: Path|str|None = None,
+        database_file: Path|str|None = None,
+        decompiled: bool = False,
+        debug: bool = False,
+        override: bool = True,
+        timeout: int|None = 600,
+        mode: ExporterMode = ExporterMode.LIGHT,
+        disassembler: Disassembler = Disassembler.UNKNOWN,
+    ) -> Path:
+        """Generate an export file directly from the binary.
+
+        Arguments:
+            exec_path: Binary to export.
+            output_file: Where to store the result (by default: near the executable)
+            database_file: Where to store IDA database (by default: near the executable)
+            decompiled: Whether to export decompiled code (default: False)
+            timeout: How long should we wait for the export to finish (default: 10 min)
+            debug: Activate the debug output
+            mode: Export mode (LIGHT or FULL)
+            disassembler: Backend to use (auto-detect if UNKNOWN)
+
+        Returns:
+            Path to the generated .quokka file.
+
+        Raises:
+            QuokkaError: If the export fails
+            FileNotFoundError: If the executable is not found
+        """
+
+        exec_path = Path(exec_path)
+        if not exec_path.is_file():
+            raise FileNotFoundError("Missing exec file")
+
+        if output_file is None:
+            output_file = exec_path.parent / f"{exec_path.name}.quokka"
+        else:
+            output_file = Path(output_file)
+
+        if output_file.is_file() and not override:
+            return output_file
+
+        if disassembler is Disassembler.UNKNOWN:
+            disassembler = Program._detect_disassembler()
+
+        match disassembler:
+            case Disassembler.GHIDRA:
+                if decompiled:
+                    Program.logger.warning(
+                        "Ghidra export does not support decompilation yet; "
+                        "ignoring --decompiled flag."
+                    )
+                return Program._generate_ghidra(
+                    exec_path=exec_path,
+                    output_file=output_file,
+                    database_file=database_file,
+                    debug=debug,
+                    timeout=timeout,
+                    mode=mode,
+                )
+            case Disassembler.IDA:
+                return Program._generate_ida(
+                    exec_path=exec_path,
+                    output_file=output_file,
+                    database_file=database_file,
+                    decompiled=decompiled,
+                    debug=debug,
+                    timeout=timeout,
+                    mode=mode,
+                )
+            case _:
+                raise QuokkaError(f"Unsupported disassembler: {disassembler}")
+
+
+    def write(self, output_file: Path|str|None = None) -> None:
+        """Write the program to a file
+
+        Arguments:
+            output_file: Where to write the program
+        """
+        if output_file is None:
+            output_file = self.export_file
+        with open(output_file, "wb") as fd:
+            fd.write(self.proto.SerializeToString())
+
+    def _commit_edits_ida(
+        self,
+        database_file: "Path|str",
+        ida_path: "Path|str|None" = None,
+        overwrite: bool = False,
+        timeout: int = 600,
+    ) -> int:
+        """Apply in-memory edits to an IDA database by spawning a headless
+        IDA instance.
+
+        The quokka file and binary paths are taken from ``self``.  The
+        caller must call :meth:`write` beforehand so the serialised
+        ``.quokka`` on disk reflects the pending edits.
+
+        Arguments:
+            database_file: Path to the ``.i64`` database to modify.
+                The database must already exist (e.g. from a prior export).
+            ida_path: Optional path to the IDA installation directory.
+                When *None*, ``idascript`` resolves it from ``IDA_PATH``
+                or ``$PATH``.
+            overwrite: If *True*, allow modifying an existing database.
+                A warning is logged when an existing database is
+                overwritten.  If *False* (the default) and the database
+                already exists, a :class:`FileExistsError` is raised.
+            timeout: Maximum seconds to wait for IDA (default 600).
+
+        Returns:
+            The number of errors reported by ``apply_quokka()`` inside
+            IDA (0 means all edits applied successfully).
+
+        Raises:
+            FileExistsError: If *database_file* exists and *overwrite*
+                is False.
+            FileNotFoundError: If *database_file* does not exist and
+                cannot be created (parent directory missing).
+            RuntimeError: If IDA times out.
+            QuokkaError: If IDA exits with an unexpected error.
+        """
+        assert idascript is not None, "idascript is required for IDA apply-back"
+
+        database_file = Path(database_file)
+
+        if database_file.exists():
+            if not overwrite:
+                raise FileExistsError(
+                    f"Database already exists: {database_file}. "
+                    "Pass overwrite=True to modify it."
+                )
+            self.logger.warning(
+                "Overwriting existing IDA database: %s", database_file
+            )
+
+        # Point idascript at backends/ida/apply.py.  The script lives in
+        # its own sub-package (not directly in backends/) so that IDA's
+        # automatic sys.path insertion does not shadow the capstone package.
+        script_file = Path(__file__).resolve().parent / "backends" / "ida" / "apply.py"
+        script_params = [
+            str(self.export_file),
+            str(self.executable.exec_file),
+        ]
+
+        old_ida_path = os.environ.get("IDA_PATH")
+        try:
+            if ida_path is not None:
+                os.environ["IDA_PATH"] = str(ida_path)
+
+            ida = idascript.IDA(
+                database_file,
+                script_file=script_file,
+                script_params=script_params,
+                timeout=timeout,
+                database_path=None,
+            )
+            ida.start()
+            ret_code = ida.wait()
+        finally:
+            if ida_path is not None:
+                if old_ida_path is None:
+                    os.environ.pop("IDA_PATH", None)
+                else:
+                    os.environ["IDA_PATH"] = old_ida_path
+
+        if ret_code == idascript.IDA.TIMEOUT_RETURNCODE:
+            raise RuntimeError(
+                f"IDA apply-back timed out after {timeout}s "
+                f"on {database_file}"
+            )
+
+        return ret_code
+
+    def _resolve_ghidra_project(
+        self,
+        database_file: "Path|str|None",
+    ) -> tuple[Path, str, bool]:
+        """Resolve the Ghidra project location/name used for apply-back."""
+
+        if database_file is None:
+            project_dir = (
+                self.export_file.parent
+                / f"{self.executable.exec_file.name}.ghidra"
+            )
+            project_name = self.executable.exec_file.stem
+        else:
+            database_path = Path(database_file)
+            if database_path.suffix == ".gpr":
+                project_dir = database_path.parent
+                project_name = database_path.stem
+            else:
+                project_dir = database_path
+                gpr_files = sorted(project_dir.glob("*.gpr")) if project_dir.is_dir() else []
+                project_name = (
+                    gpr_files[0].stem if len(gpr_files) == 1
+                    else self.executable.exec_file.stem
+                )
+
+        return project_dir, project_name, (project_dir / f"{project_name}.gpr").exists()
+
+    def _commit_edits_ghidra(
+        self,
+        database_file: "Path|str|None" = None,
+        ghidra_path: "Path|str|None" = None,
+        overwrite: bool = False,
+        timeout: int = 600,
+    ) -> int:
+        """Apply in-memory edits to a persistent Ghidra project.
+
+        The caller must call :meth:`write` first so the on-disk ``.quokka``
+        contains the pending edits.
+        """
+
+        env_dir = ghidra_path or os.environ.get("GHIDRA_INSTALL_DIR")
+        if not env_dir:
+            raise QuokkaError(
+                "Ghidra not found. Set GHIDRA_INSTALL_DIR or pass ghidra_path."
+            )
+        ghidra_dir = Path(env_dir)
+        analyze_headless = ghidra_dir / "support" / "analyzeHeadless"
+        if not analyze_headless.exists():
+            raise QuokkaError(f"analyzeHeadless not found at {analyze_headless}")
+
+        ext_path = _find_ghidra_extension(ghidra_dir)
+        if ext_path is None:
+            raise QuokkaError(
+                "QuokkaExporter extension not found. Install it from "
+                "https://github.com/quarkslab/quokka/tree/main/ghidra_extension"
+            )
+
+        script_path = None
+        scripts_dir = ext_path / "ghidra_scripts"
+        if (scripts_dir / "QuokkaApplyHeadless.java").exists():
+            script_path = scripts_dir
+        if script_path is None:
+            repo_script = (
+                Path(__file__).resolve().parent.parent.parent.parent
+                / "ghidra_extension" / "src" / "script" / "ghidra_scripts"
+            )
+            if (repo_script / "QuokkaApplyHeadless.java").exists():
+                script_path = repo_script
+        if script_path is None:
+            raise QuokkaError(
+                "QuokkaApplyHeadless.java not found. Install the Ghidra "
+                "extension or run from the quokka source tree."
+            )
+
+        project_dir, project_name, project_exists = self._resolve_ghidra_project(
+            database_file
+        )
+        if project_exists:
+            if not overwrite:
+                raise FileExistsError(
+                    f"Ghidra project already exists: "
+                    f"{project_dir / (project_name + '.gpr')}. "
+                    "Pass overwrite=True to modify it."
+                )
+            self.logger.warning(
+                "Modifying existing Ghidra project: %s",
+                project_dir / f"{project_name}.gpr",
+            )
+        else:
+            project_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            str(analyze_headless),
+            str(project_dir),
+            project_name,
+        ]
+        if project_exists:
+            cmd.extend(["-process", self.executable.exec_file.name])
+        else:
+            cmd.extend(["-import", str(self.executable.exec_file)])
+        cmd.extend([
+            "-scriptPath", str(script_path),
+            "-postScript", "QuokkaApplyHeadless.java",
+            f"--quokka={self.export_file}",
+        ])
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout if timeout else None,
+        )
+
+        output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+        match = re.search(r"Quokka apply complete: (\d+) error\(s\)", output)
+        if result.returncode != 0:
+            raise QuokkaError(
+                f"Ghidra apply-back failed for {self.executable.exec_file} "
+                f"(rc={result.returncode}):\n{output[-2000:]}"
+            )
+        if match is None:
+            raise QuokkaError(
+                "Ghidra apply-back did not report an error count:\n"
+                f"{output[-2000:]}"
+            )
+        return int(match.group(1))
+
+    def commit(
+        self,
+        database_file: "Path|str|None" = None,
+        disassembler_path: "Path|str|None" = None,
+        overwrite: bool = True,
+        timeout: int = 600,
+    ) -> int:
+        """Write the .quokka and apply edits to the disassembler database.
+
+        The target disassembler is determined by the backend recorded in the
+        ``.quokka`` file (``self.disassembler``): edits are always applied with
+        the same disassembler that produced the export.
+
+        Arguments:
+            database_file: Path to the disassembler database.  For IDA this is
+                an ``.i64`` database.  For Ghidra this is either a ``.gpr`` file
+                or a directory that contains/should contain a Ghidra project.
+            disassembler_path: Optional installation path for the disassembler
+                selected by ``self.disassembler`` (the IDA install dir for an
+                IDA export, the Ghidra install dir for a Ghidra export).
+            overwrite: Allow modifying an existing database.
+            timeout: Disassembler timeout in seconds.
+
+        Returns:
+            The number of apply errors (0 = success).
+
+        Raises:
+            ValueError: If *database_file* is not provided for an IDA
+                program.
+        """
+        self.write()
+        match self.disassembler:
+            case Disassembler.IDA:
+                if database_file is None:
+                    database_file = str(self.executable.exec_file) + ".i64"
+                return self._commit_edits_ida(
+                    database_file,
+                    ida_path=disassembler_path,
+                    overwrite=overwrite,
+                    timeout=timeout,
+                )
+            case Disassembler.GHIDRA:
+                return self._commit_edits_ghidra(
+                    database_file,
+                    ghidra_path=disassembler_path,
+                    overwrite=overwrite,
+                    timeout=timeout,
+                )
+            case Disassembler.BINARY_NINJA:
+                raise NotImplementedError("Binary Ninja export is not implemented yet")
+            case _:
+                raise NotImplementedError("Unknown disassembler")
+
+
+    def regenerate(
+        self,
+        database_file: "Path|str|None" = None,
+        disassembler_path: "Path|str|None" = None,
+        overwrite: bool = True,
+        timeout: int = 600,
+    ) -> 'Program':
+        """Apply edits, re-export, and return a fresh Program.
+
+        Calls :meth:`commit` to apply edits, then :meth:`generate` to
+        produce a new ``.quokka`` file.
+
+        Arguments:
+            database_file: Path to the disassembler database/project.
+            disassembler_path: Optional installation path for the disassembler
+                selected by ``self.disassembler``.
+            overwrite: Allow modifying an existing database.
+            timeout: IDA timeout in seconds.
+
+        Returns:
+            A new Program instance with the updated data.
+
+        Raises:
+            QuokkaError: If applying changes or regenerating fails.
+        """
+        errors = self.commit(
+            database_file=database_file,
+            disassembler_path=disassembler_path,
+            overwrite=overwrite,
+            timeout=timeout,
+        )
+        if errors:
+            self.logger.warning(
+                "%d errors occurred while applying edits", errors
+            )
+        path = Program.generate(
+            self.executable.exec_file,
+            self.export_file,
+            database_file=database_file,
+            override=True,
+            disassembler=self.disassembler,
+        )
+        return Program.open(path, self.executable.exec_file)

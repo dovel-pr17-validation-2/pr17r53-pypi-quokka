@@ -1,0 +1,94 @@
+site_name: Quokka
+site_description: A Fast and Accurate Binary Exporter
+repo_url: "https://github.com/quarkslab/quokka"
+repo_name: "quarkslab/quokka"
+
+# Since the default branch is main, the default edit URL does not work
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  logo: img/logo.png
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - content.code.annotate
+
+nav:
+  - Home: README.md
+  - Installation: installation.md
+  - Usage: usage.md
+  - Features: features.md
+  - API Guide:
+      - Program & Metadata: program.md
+      - Functions: functions.md
+      - Basic Blocks & CFG: blocks.md
+      - Instructions & Operands: instructions.md
+      - Types: types.md
+      - Cross-References: xrefs.md
+      - Decompilation: decompilation.md
+      - P-code Lifting: pcode.md
+      - Write Features: write_feature.md
+  - Tutorials:
+      - First steps: tutorials/qb-crackme/
+      - Features extraction: tutorials/features/
+      - Bionic: tutorials/bionic/
+  - C++ Reference: reference/cpp/
+  - Python Reference: reference/python/
+  - Examples: example.md
+  - Philosophy: philosophy.md
+  - Roadmap: roadmap.md
+  - Developers:
+      - Contributing: contributing.md
+      - Tips & Tricks: dev.md
+  - FAQ: FAQ.md
+
+extra_css:
+  - css/extra.css
+
+markdown_extensions:
+  - admonition
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - attr_list
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - footnotes
+
+plugins:
+  - autorefs
+  - search
+  - gen-files:
+      scripts:
+        - docs/gen_ref_pages.py
+  - literate-nav
+  - git-revision-date-localized:
+      enable_creation_date: true
+      type: date
+      fallback_to_build_date: true
+  - mkdocstrings:
+      handlers:
+        python:
+          paths:
+            - bindings/python
+  - mkdocs-simple-hooks:
+      hooks:
+        on_post_build: "docs.doxygen:generate_cpp_documentation"

@@ -1,0 +1,80 @@
+// Copyright 2022-2023 Quarkslab
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <cassert>
+#include <string>
+
+// clang-format off: Compatibility.h must come before ida headers
+#include "quokka/Compatibility.h"
+// clang-format on
+#include <pro.h>
+#include <bytes.hpp>
+#include <idp.hpp>
+#include <name.hpp>
+#include <typeinf.hpp>
+
+#include "quokka/Util.h"
+
+namespace quokka {
+
+std::string ConvertIdaString(const qstring& ida_string) {
+  return {ida_string.c_str(), ida_string.length()};
+}
+
+std::string GetName(ea_t address, bool mangled) {
+  flags_t flags = get_flags(address);
+  if (!mangled && has_user_name(flags)) {
+    return ConvertIdaString(get_short_name(address));
+  }
+
+  return ConvertIdaString(get_name(address, GN_VISIBLE));
+}
+
+processor_t* GetProcessor() {
+#if IDA_SDK_VERSION >= 750
+  return get_ph();
+#else
+  return &ph;
+#endif
+}
+
+std::string GetMnemonic(const insn_t& instruction) {
+#if IDA_SDK_VERSION >= 750
+  processor_t* processor = get_ph();
+  return {instruction.get_canon_mnem(*processor)};
+#else
+  return {instruction.get_canon_mnem()};
+#endif
+}
+
+void ResolveTypedef(tinfo_t& tif) {
+  if (!tif.is_typedef() && !tif.is_typeref())
+    return;
+
+  uint32_t final_ordinal = tif.get_final_ordinal();
+  if (final_ordinal > 0) {
+    assert(final_ordinal > 0 && "");
+    if (!tif.get_numbered_type(final_ordinal))
+      assert(false && "Cannot get type info for resolved ordinal");
+  } else {  // Sometimes typedef/typeref don't have a final ordinal
+    // Try with the name and pray
+    qstring final_name;
+    bool res = tif.get_final_type_name(&final_name);
+    assert(res && "IDA failed to resolve a typedef");
+    res = tif.get_named_type(final_name.c_str());
+    assert(res && "IDA failed to retrieve a type from a string");
+  }
+}
+
+}  // namespace quokka

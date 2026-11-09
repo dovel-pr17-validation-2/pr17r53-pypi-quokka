@@ -1,0 +1,168 @@
+// Copyright 2022-2023 Quarkslab
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/**
+ * @file Data.h
+ *
+ * Functions related to the Data management
+ */
+
+#ifndef QUOKKA_DATA_H
+#define QUOKKA_DATA_H
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <utility>
+
+// clang-format off: Compatibility.h must come before ida headers
+#include "Compatibility.h"
+// clang-format on
+#include <pro.h>
+
+#include "absl/hash/hash.h"
+
+#include "DataType.h"
+#include "ProtoHelper.h"
+#include "Reference.h"
+#include "Segment.h"
+
+namespace quokka {
+
+/**
+ * -----------------------------------------------------------------------------
+ * quokka::Data
+ * -----------------------------------------------------------------------------
+ * Data representation
+ *
+ * `Data` represents everything IDA considers to be data.
+ */
+class Data : public ProtoHelper {
+ private:
+  std::string name;  ///< If applicable, the name of the data
+
+  /**
+   * Constructor
+   *
+   * @param addr_ Address where the data has been found
+   * @param data_type_ Type of the data
+   * @param size_ Size of the data
+   * @param file_offset_ File offset of the data
+   * @param segment_ IDA segment
+   */
+  Data(ea_t addr_, BaseType base_type_, uint64_t size_, int64_t file_offset_,
+       const Segment* segment_)
+      : addr(addr_), size(size_), file_offset(file_offset_), segment(segment_) {
+    switch (base_type_) {
+      case TYPE_POINTER:
+      case TYPE_ARRAY:
+      case TYPE_STR:
+      case TYPE_ALIGN:
+        base_type = TYPE_UNK;
+        break;
+      default:
+        base_type = TYPE_UNK;
+        break;
+    }
+
+    if (HasName(false))
+      this->SetName();
+  }
+
+  /**
+   * Has the data a name ?
+   *
+   * Answers using the flags associated to the address.
+   *
+   * @param any_name Check any name or just the user_name
+   */
+  [[nodiscard]] bool HasName(bool any_name) const;
+
+  /**
+   * Set the name of the data
+   */
+  void SetName();
+
+ public:
+  ea_t addr = BADADDR;            ///< Address attached to the data
+  BaseType base_type = TYPE_UNK;  ///< Data type
+  uint32_t size;  ///< Size of the data (not always redundant for certain types)
+  const Segment* segment;  ///< IDA segment. It has to outlive Data
+  int64 file_offset;       ///< File offset, if <0 then there is none
+  mutable Xref xrefs;
+  std::optional<type_uid_t>
+      target_tuid;  ///< type UID when the data not of a base type
+
+  /**
+   * Static method to build a Data object
+   *
+   * @param addr The address at which the data is located
+   * @param size The size of the data object
+   * @return The newly built Data object
+   */
+  static Data Make(ea_t addr, uint32_t size);
+
+  /**
+   * Accessor for the name
+   * @return The name
+   */
+  [[nodiscard]] const std::string& GetName() const { return name; }
+
+  /**
+   * Tells if the data referenced is initialized or not (like in .bss
+   segment)
+   * using the flags associated to the address.
+   *
+   * @return True if the data is initialized, False otherwise.
+   */
+  [[nodiscard]] bool IsInitialized() const;
+
+  /**
+   * Equality operator
+   *
+   * Two objects are considered equal when they are at the same address and have
+   * the same size
+   */
+  bool operator==(const Data& rhs) const {
+    return addr == rhs.addr && size == rhs.size;
+  }
+
+  /**
+   * Inequality operator
+   */
+  bool operator!=(const Data& rhs) const { return !(rhs == *this); }
+
+  /**
+   * Hash implementation of the object using absl::Hash
+   * @tparam H Hash
+   * @param h Hash value
+   * @param m Data object
+   * @return An hash value for the object
+   */
+  template <typename H>
+  friend H AbslHashValue(H h, const Data& m) {
+    return H::combine(std::move(h), m.addr, m.size);
+  }
+};
+
+/**
+ * Export all the references to the provided data
+ *
+ * @param data Data object
+ */
+void ExportDataReferences(const Data& data);
+
+}  // namespace quokka
+
+#endif  // QUOKKA_DATA_H
